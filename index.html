@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Galaxy Simulation with Tracers</title>
+    <style>
+        body { margin: 0; overflow: hidden; }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+    <canvas id="canvasWebGL2"></canvas>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gl-matrix/2.8.1/gl-matrix-min.js"></script>
+    <script>
+const [width, height] = [window.innerWidth, window.innerHeight]
+
+const main = async () => {
+    const canvas = document.getElementById("canvasWebGL2")
+    const gl = canvas.getContext("webgl2")
+
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    const program = gl.createProgram()
+    setShader(gl, program, vert, frag)
+    gl.linkProgram(program)
+
+    // Check if program linked successfully
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        console.error('Unable to initialize the shader program: ' + gl.getProgramInfoLog(program));
+        return;
+    }
+
+    gl.useProgram(program)
+
+    resizeCanvas(canvas, gl, width, height)
+
+    let positionData = []
+    let colorData = []
+    let prevPositionData = []
+    let currentPositionData = []
+
+    const numPoints = 200000
+    const numArms = 5
+    const armSpread = 0.5
+    const diskRadius = 1.0
+    const diskThickness = 0.2
+    const bulgeSize = 0.3
+
+    for (let i = 0; i < numPoints; i++) {
+        const r = Math.pow(Math.random(), 0.5) * diskRadius
+        const theta = random(0, 2 * Math.PI)
+        const armOffset = (i % numArms) * (2 * Math.PI / numArms)
+        const spiralTheta = theta + armOffset + armSpread * Math.pow(r, 0.5)
+
+        const x = r * Math.cos(spiralTheta)
+        const y = r * Math.sin(spiralTheta)
+        
+        const bulgeTransition = Math.pow(Math.min(1, r / bulgeSize), 2)
+        const diskProfile = Math.sqrt(1 - (r / diskRadius) ** 2)
+        const heightFactor = mix(1, diskProfile, bulgeTransition)
+        const maxHeight = diskThickness * heightFactor
+
+        let z
+        if (r < bulgeSize) {
+            const phi = Math.acos(2 * Math.random() - 1)
+            z = r * Math.cos(phi) * (bulgeSize - r) / bulgeSize
+        } else {
+            z = (Math.random() - 0.5) * maxHeight
+        }
+
+        positionData.push(x, y, z)
+        currentPositionData.push(x, y, z)
+        prevPositionData.push(x, y, z)
+
+        const distanceFromCenter = Math.sqrt(x*x + y*y + z*z)
+        const normalizedDistance = distanceFromCenter / diskRadius
+        const brightness = 0.5 + 0.5 * (1 - normalizedDistance)
+        colorData.push(brightness, brightness, 1, 1)
+    }
+
+    // Add black hole data
+    positionData.push(0, 0, 0)
+    currentPositionData.push(0, 0, 0)
+    prevPositionData.push(0, 0, 0)
+    colorData.push(0, 0, 0, 1)
+
+    const positionBuffer = gl.createBuffer()
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer)
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positionData), gl.DYNAMIC_DRAW)
+    const posLoc = gl.getAttribLocation(program, "aPosition")
+    gl.vertexAttribPointer(posLoc, 3, gl.FLOAT, false, 0, 0)
+    gl.enableVertexAttribArray(posLoc)
+
+    const prevPositionBuffer = gl.createBuffer()
+    gl.bindBuffer(gl.ARRAY_BUFFER, prevPositionBuffer)
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(prevPositionData), gl.DYNAMIC_DRAW)
+    const prevPosLoc = gl.getAttribLocation(program, "aPrevPosition")
+    gl.vertexAttribPointer(prevPosLoc, 3, gl.FLOAT, false, 0, 0)
+    gl.enableVertexAttribArray(prevPosLoc)
+
+    const colorBuffer = gl.createBuffer()
+    gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer)
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(colorData), gl.STATIC_DRAW)
+    const colorLoc = gl.getAttribLocation(program, "aColor")
+    gl.vertexAttribPointer(colorLoc, 4, gl.FLOAT, false, 0, 0)
+    gl.enableVertexAttribArray(colorLoc)
+
+    let time = 0
+    const timeLoc = gl.getUniformLocation(program, "uTime")
+    const rotationSpeedLoc = gl.getUniformLocation(program, "uRotationSpeed")
+    const primaryRotationSpeedLoc = gl.getUniformLocation(program, "uPrimaryRotationSpeed")
+    const secondaryRotationSpeedLoc = gl.getUniformLocation(program, "uSecondaryRotationSpeed")
+    const projectionMatrixLoc = gl.getUniformLocation(program, "uProjectionMatrix")
+    const viewMatrixLoc = gl.getUniformLocation(program, "uViewMatrix")
+    const blackHoleSizeLoc = gl.getUniformLocation(program, "uBlackHoleSize")
+
+    gl.enable(gl.DEPTH_TEST)
+
+    const projectionMatrix = mat4.create()
+    mat4.perspective(projectionMatrix, Math.PI / 4, width / height, 0.1, 100)
+
+    const viewMatrix = mat4.create()
+    mat4.lookAt(viewMatrix, [1.6, 1.6, 1.6], [0, 0, 0], [0, 0, 1])
+
+    const draw = () => {
+        gl.clearColor(0, 0, 0, 1)
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+
+        gl.uniform1f(timeLoc, time)
+        gl.uniform1f(rotationSpeedLoc, 0.5)
+        gl.uniform1f(primaryRotationSpeedLoc, 0.5)
+        gl.uniform1f(secondaryRotationSpeedLoc, 0.8)
+        gl.uniformMatrix4fv(projectionMatrixLoc, false, projectionMatrix)
+        gl.uniformMatrix4fv(viewMatrixLoc, false, viewMatrix)
+        gl.uniform1f(blackHoleSizeLoc, 100.0)
+
+        // Update previous positions
+        gl.bindBuffer(gl.ARRAY_BUFFER, prevPositionBuffer)
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, new Float32Array(currentPositionData))
+
+        // Update current positions
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer)
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, new Float32Array(positionData))
+
+        // Draw stars and black hole
+        gl.drawArrays(gl.POINTS, 0, numPoints + 1)
+
+        // Update currentPositionData for next frame
+        for (let i = 0; i < positionData.length; i++) {
+            currentPositionData[i] = positionData[i]
+        }
+
+        time += 0.005
+        requestAnimationFrame(draw)
+    }
+    draw()
+}
+
+const vert = `#version 300 es
+precision highp float;
+
+in vec3 aPosition;
+in vec3 aPrevPosition;
+in vec4 aColor;
+
+uniform float uTime;
+uniform float uRotationSpeed;
+uniform float uPrimaryRotationSpeed;
+uniform float uSecondaryRotationSpeed;
+uniform mat4 uProjectionMatrix;
+uniform mat4 uViewMatrix;
+uniform float uBlackHoleSize;
+
+out vec4 vColor;
+out vec3 vPrevPos;
+out vec3 vCurrentPos;
+
+// Noise functions
+vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+vec4 permute(vec4 x) { return mod289(((x*34.0)+1.0)*x); }
+vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+
+float snoise(vec3 v) {
+  const vec2 C = vec2(1.0/6.0, 1.0/3.0) ;
+  const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+  
+  vec3 i  = floor(v + dot(v, C.yyy));
+  vec3 x0 = v - i + dot(i, C.xxx);
+  
+  vec3 g = step(x0.yzx, x0.xyz);
+  vec3 l = 1.0 - g;
+  vec3 i1 = min(g.xyz, l.zxy);
+  vec3 i2 = max(g.xyz, l.zxy);
+  
+  vec3 x1 = x0 - i1 + C.xxx;
+  vec3 x2 = x0 - i2 + C.yyy;
+  vec3 x3 = x0 - D.yyy;
+  
+  i = mod289(i);
+  vec4 p = permute(permute(permute(
+             i.z + vec4(0.0, i1.z, i2.z, 1.0))
+           + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+           + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+           
+  float n_ = 0.142857142857;
+  vec3 ns = n_ * D.wyz - D.xzx;
+  
+  vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+  
+  vec4 x_ = floor(j * ns.z);
+  vec4 y_ = floor(j - 7.0 * x_);
+  
+  vec4 x = x_ *ns.x + ns.yyyy;
+  vec4 y = y_ *ns.x + ns.yyyy;
+  vec4 h = 1.0 - abs(x) - abs(y);
+  
+  vec4 b0 = vec4(x.xy, y.xy);
+  vec4 b1 = vec4(x.zw, y.zw);
+  
+  vec4 s0 = floor(b0)*2.0 + 1.0;
+  vec4 s1 = floor(b1)*2.0 + 1.0;
+  vec4 sh = -step(h, vec4(0.0));
+  
+  vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy ;
+  vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww ;
+  
+  vec3 p0 = vec3(a0.xy, h.x);
+  vec3 p1 = vec3(a0.zw, h.y);
+  vec3 p2 = vec3(a1.xy, h.z);
+  vec3 p3 = vec3(a1.zw, h.w);
+  
+  vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2, p2), dot(p3,p3)));
+  p0 *= norm.x;
+  p1 *= norm.y;
+  p2 *= norm.z;
+  p3 *= norm.w;
+  
+  vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+  m = m * m;
+  return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+}
+
+void main() {
+    vec3 pos = aPosition;
+    vec3 prevPos = aPrevPosition;
+    
+    bool isBlackHole = pos.x == 0.0 && pos.y == 0.0 && pos.z == 0.0;
+    
+    float distanceFromCenter = length(pos);
+    
+    if (!isBlackHole) {
+        float primaryAngle = uTime * uPrimaryRotationSpeed;
+        mat3 primaryRotation = mat3(
+            cos(primaryAngle), 0.0, sin(primaryAngle),
+            0.0, 1.0, 0.0,
+            -sin(primaryAngle), 0.0, cos(primaryAngle)
+        );
+        pos = primaryRotation * pos;
+        
+        float secondaryAngle = uTime * uSecondaryRotationSpeed;
+        mat3 secondaryRotation = mat3(
+            1.0, 0.0, 0.0,
+            0.0, cos(secondaryAngle), -sin(secondaryAngle),
+            0.0, sin(secondaryAngle), cos(secondaryAngle)
+        );
+        pos = secondaryRotation * pos;
+        
+        float rotationFactor = 1.0 - distanceFromCenter;
+        float angle = uTime * uRotationSpeed * (rotationFactor + 0.1);
+        mat3 rotation = mat3(
+            cos(angle), 0.0, sin(angle),
+            0.0, 1.0, 0.0,
+            -sin(angle), 0.0, cos(angle)
+        );
+        pos = rotation * pos;
+        
+        float noiseScale = 5.0;
+        float noiseStrength = 0.03;
+        vec3 noiseInput = vec3(pos.x * noiseScale + uTime * 0.1, 
+                               pos.y * noiseScale + uTime * 0.1, 
+                               pos.z * noiseScale + uTime * 0.1);
+        vec3 noiseOffset = vec3(
+            snoise(noiseInput),
+            snoise(noiseInput + 100.0),
+            snoise(noiseInput + 200.0)
+        );
+        pos += noiseOffset * noiseStrength * (distanceFromCenter + 0.2);
+        
+        float pulse = sin(uTime * 2.0) * 0.01 + 1.0;
+        pos *= pulse;
+        
+        float pullStrength = 0.1 / (distanceFromCenter * distanceFromCenter + 0.1);
+        pos -= normalize(pos) * pullStrength * 0.001;
+    }
+    
+    gl_Position = uProjectionMatrix * uViewMatrix * vec4(pos, 1.0);
+
+    if (isBlackHole) {
+        gl_PointSize = uBlackHoleSize / gl_Position.w;
+    } else {
+        float sizePulse = sin(uTime * 3.0 + distanceFromCenter * 10.0) * 0.2 + 1.5;
+        gl_PointSize = mix(10.0, 2.0, distanceFromCenter) * sizePulse / gl_Position.w; // Increased size
+    }
+
+    vColor = aColor;
+    vPrevPos = mix(prevPos, pos, 0.05); // Adjust this value (0.05) to control trail length
+    vCurrentPos = pos;
+}
+`
+
+const frag = `#version 300 es
+precision highp float;
+
+in vec4 vColor;
+in vec3 vCurrentPos;
+in vec3 vPrevPos;
+out vec4 fragColor;
+
+uniform mat4 uProjectionMatrix;
+uniform mat4 uViewMatrix;
+
+void main() {
+    vec2 circCoord = 2.0 * gl_PointCoord - 1.0;
+    float dist = length(circCoord);
+    
+    if (vColor.rgb == vec3(0.0)) {
+        // This is the black hole
+        float eventHorizon = 0.5;
+        if (dist > eventHorizon) {
+            float t = (dist - eventHorizon) / (1.0 - eventHorizon);
+            fragColor = mix(vec4(0.0, 0.0, 0.0, 1.0), vec4(0.1, 0.0, 0.2, 0.0), t);
+        } else {
+            fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        }
+    } else {
+        // This is a star
+        if (dist <= 1.0) {
+            // Draw star
+            fragColor = vColor;
+        } else {
+            // Draw tracer
+            vec4 currentPos = uProjectionMatrix * uViewMatrix * vec4(vCurrentPos, 1.0);
+            vec4 prevPos = uProjectionMatrix * uViewMatrix * vec4(vPrevPos, 1.0);
+            vec2 trailDir = normalize(currentPos.xy - prevPos.xy);
+            float trailDist = dot(circCoord, trailDir);
+            
+            if (trailDist > 0.0 && trailDist < 10.0) { // Increased trail length
+                float alpha = smoothstep(10.0, 0.0, trailDist) * 0.5; // Adjusted alpha
+                fragColor = vec4(vColor.rgb, alpha);
+            } else {
+                discard;
+            }
+        }
+    }
+}
+`
+
+function random(min, max) {
+    return Math.random() * (max - min) + min;
+}
+
+function resizeCanvas(canvas, gl, width, height) {
+    canvas.width = width;
+    canvas.height = height;
+    gl.viewport(0, 0, canvas.width, canvas.height);
+}
+
+function setShader(gl, program, vert, frag) {
+    const vertexShader = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vertexShader, vert);
+    gl.compileShader(vertexShader);
+    gl.attachShader(program, vertexShader);
+
+    const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fragmentShader, frag);
+    gl.compileShader(fragmentShader);
+    gl.attachShader(program, fragmentShader);
+}
+
+function setAttributeVec3(gl, program, name, data) {
+    const bufferData = new Float32Array(data);
+    const location = gl.getAttribLocation(program, name);
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, bufferData, gl.STATIC_DRAW);
+    gl.vertexAttribPointer(location, 3, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(location);
+}
+
+function setAttributeVec4(gl, program, name, data) {
+    const bufferData = new Float32Array(data);
+    const location = gl.getAttribLocation(program, name);
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, bufferData, gl.STATIC_DRAW);
+    gl.vertexAttribPointer(location, 4, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(location);
+}
+
+function mix(a, b, t) {
+    return a * (1 - t) + b * t;
+}
+
+main();
+    </script>
+</body>
+</html>
